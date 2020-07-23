@@ -1,0 +1,25 @@
+#!/bin/sh
+fileName=$1
+usage()
+{
+	echo "USAGE : ai  [input_file]"
+	#exit 1
+}
+
+if [ $# -eq 0 ]; then
+echo -e "capc: fatal error: no input files"
+echo -e "compilation terminated."
+exit 0
+fi
+
+clang -S -emit-llvm $fileName
+#name=$(echo "$filename" | cut -f 1 -d '.')
+tmp=$(echo $fileName | rev | cut -f 2- -d '.' | rev)
+newName="${tmp}.ll"
+libpath=$LLVM/lib/AI.so
+opt -load $libpath -ai $newName
+
+
+
+
+

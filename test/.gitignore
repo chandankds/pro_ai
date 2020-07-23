@@ -1,0 +1,9 @@
+df-*
+a.out
+
+###############################
+# results of testing commands #
+###############################
+
+kremlin.bin.reference
+SConstruct.kremlin

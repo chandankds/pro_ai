@@ -1,0 +1,18 @@
+env = Environment(CCFLAGS = '-O3')
+
+# default c++ library (libc++) doesn't work on Mac (bug?)
+if env['PLATFORM'] == 'darwin':
+    env.Append(CCFLAGS = ' -stdlib=libstdc++')
+
+files = ['debug.cpp', 'kremlin.cpp', 'MemMapAllocator.cpp',
+    'ProfileNode.cpp', 'CRegion.cpp', 'ProfileNodeStats.cpp', 
+	'MShadowBase.cpp', 'MShadowSkadu.cpp', 'MShadowSTV.cpp', 
+	'compression.cpp', 'config.cpp', 'minilzo.cpp', 'mpool.cpp',
+    'MShadowStat.cpp', 'MShadowDummy.cpp', 'MShadowCache.cpp',
+	'MShadowNullCache.cpp', 'TagVectorCache.cpp', 'TagVectorCacheLine.cpp',
+	'Handlers.cpp','TimeTable.cpp', 'LevelTable.cpp'
+	]
+kremlib_dynamic = env.SharedLibrary('kremlin', files)
+files.append('arg.cpp')
+kremlib_static = env.Library('kremlin', files)
+Return('kremlib_static kremlib_dynamic')

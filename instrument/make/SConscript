@@ -1,0 +1,215 @@
+import os
+
+Import('env','input_files', 'target', 'output_file', 'make_output_file')
+
+llvm_ver = '3.6.1'
+
+kremlin_root_dir = os.path.abspath(os.path.join(os.getcwd(),"../..")) + os.sep
+llvm_bin_dir = kremlin_root_dir + 'instrument/llvm/install/bin/'
+kremlin_instrument_src_dir = kremlin_root_dir + 'instrument/src/'
+kremlib_dir = kremlin_root_dir + 'runtime/src/'
+llvm_clang = llvm_bin_dir + 'clang'
+llvm_clangxx = llvm_clang + '++'
+llvm_opt = llvm_bin_dir + 'opt'
+llvm_llc = llvm_bin_dir + 'llc'
+
+kremlin_llvm_shared_obj = kremlin_root_dir + 'instrument/llvm/install/lib/' + \
+	'KremlinInstrument' + env['SHLIBSUFFIX']
+
+#conf = Configure(env)
+#if not config.CheckHeader
+
+def generate_opt_actions(target, source, env, for_signature):
+	""" Generate a rule to run opt based on the target filename extension """
+	built_in_passes = ['indvars','mem2reg','simplifycfg','O1','02','O3']
+	target_name_splits = str.split(str(target[0]),'.')
+	action = target_name_splits[-2]
+	if action not in built_in_passes:
+		load_string = ' -load ' + kremlin_llvm_shared_obj
+	else:
+		load_string = ' '
+	action_str = llvm_opt + load_string + ' -' + action + \
+			' -o ' + str(target[0]) + ' ' + str(source[0])
+	if action == 'regioninstrument':
+		action_str += ' -kremlib-dump'
+	action_str += ' &> ' + target_name_splits[0] + '.' + action + '.log'
+	return action_str
+
+llc_opts = ' -march=x86-64'
+compile_opts = ' '
+
+if env['PLATFORM'] == 'darwin':
+	llc_opts += ' -mattr=-avx'
+	# for some reason mac's default libc++ doesn't work (bug?)
+	compile_opts += '-stdlib=libstdc++' 
+	env['LINKFLAGS'] = '-stdlib=libstdc++'
+    
+if str(env['CCFLAGS']).find('-fPIC') != -1:
+	llc_opts += ' -relocation-model=pic'
+
+llvm_bc_bld = Builder(action = llvm_clang + compile_opts + \
+					' $CCFLAGS -g -emit-llvm -c -o $TARGET $SOURCE')
+
+plain_clang_bld = Builder(action = llvm_clang + compile_opts + \
+					' $CCFLAGS -o $TARGET $SOURCES')
+plain_clang_no_target_bld = Builder(action = llvm_clang + compile_opts + \
+					' $CCFLAGS $SOURCES')
+
+llvm_asm_bld = Builder(action = llvm_llc + \
+					llc_opts + ' -o $TARGET $SOURCE',
+					suffix = '.s',
+					src_suffix = '.bc')
+
+opt_bld = Builder(generator = generate_opt_actions)
+
+env['BUILDERS']['LLVMBitCode'] = llvm_bc_bld
+env['BUILDERS']['LLVMOpt'] = opt_bld
+env['BUILDERS']['InstrumentedAssembly'] = llvm_asm_bld
+env['BUILDERS']['PlainClang'] = plain_clang_bld
+env['BUILDERS']['PlainClangNoTarget'] = plain_clang_no_target_bld
+
+# use clang to assemble because the built-in assembler has problems on some
+# platforms **glares at Mac OS X**
+env['AS'] = llvm_clang
+env['ASFLAGS'] = '-c'
+
+env['LINK'] = llvm_clangxx
+
+def get_prefix_str(filename):
+	filename_split = str.split(filename,'.')
+	prefix = filename_split[:-1]
+	prefix_str = '.'.join(prefix)
+	return prefix_str
+
+def compile_files(source_filenames):
+	def get_subdirs(path):
+		""" Recursively build list of all subdir names """
+		subdirs = [name for name in os.listdir(path) \
+					if os.path.isdir(os.path.join(path,name)) \
+						and name[0] != '.']
+		for sd in subdirs:
+			subdirs.extend(['{0}/{1}'.format(sd,x) for x in
+							get_subdirs(os.path.join(path,sd))])
+
+		return subdirs
+
+	# FIXME: we also need to check for *.tcc files
+	so_srcs = Glob(kremlin_instrument_src_dir + '*.cpp')
+	for d in get_subdirs(kremlin_instrument_src_dir):
+		glob_str = os.path.join(kremlin_instrument_src_dir,d,'*.cpp')
+		so_srcs += Glob(glob_str)
+
+	asm_nodes = []
+	for filename in source_filenames:
+		filename_split = str.split(filename,'.')
+		prefix_str = get_prefix_str(filename)
+		filename_split[-1] = 'bc'
+		env.LLVMBitCode('.'.join(filename_split), filename)
+
+		opt_passes = ['simplifycfg','mem2reg','indvars', \
+						'elimsinglephis','criticalpath','regioninstrument', \
+						'renamemain','O3']
+		pass_str = ''
+		for p in opt_passes:
+			input_pass_str = pass_str
+			pass_str += '.' + p
+			t = env.LLVMOpt(prefix_str + pass_str + '.bc', \
+						prefix_str + input_pass_str + '.bc')
+			log_name = prefix_str + '.' + p + '.log'
+			Clean(t, log_name)
+			if p == 'criticalpath':
+				Clean(t, prefix_str + '.ids.txt')
+			elif p == 'regioninstrument':
+				Clean(t, prefix_str + '.kdump')
+
+		if output_file == '' or target != 'compile':
+			filename_split[-1] = 's'
+			asm_target = '.'.join(filename_split)
+		else:
+			asm_target = output_file
+
+		asm_nodes.extend(env.InstrumentedAssembly(asm_target, \
+							prefix_str + '.' + '.'.join(opt_passes) + '.bc'))
+
+	return asm_nodes
+
+def assemble_files(source_filenames):
+	# XXX: assuming pre-assembled files end with .s
+	to_compile = [f for f in source_filenames if not f.endswith('.s')]
+	pre_compiled = [f for f in source_filenames if f not in to_compile]
+
+	newly_compiled = compile_files(to_compile)
+
+	obj_nodes = []
+	for asm_file in pre_compiled + newly_compiled:
+		if output_file != '' and target == 'assemble':
+			obj_target_name = output_file
+		elif asm_file in pre_compiled:
+			obj_target_name = get_prefix_str(asm_file)
+		else:
+			obj_target_name = get_prefix_str(str(asm_file))
+
+		obj_nodes.extend(env.Object(obj_target_name, asm_file))
+
+	return obj_nodes
+
+if target == 'gen-make-rule':
+	if make_output_file == '' and output_file == '':
+		gen = env.PlainClangNoTarget(None,input_files)
+	elif make_output_file != '' and output_file != '':
+		gen = [env.PlainClang(make_output_file,input_files)]
+		gen.append(env.Command(output_file,None,'touch $TARGET'))
+	elif make_output_file != '':
+		gen = env.PlainClang(make_output_file,input_files)
+	else:
+		gen = env.PlainClang(output_file,input_files)
+
+	env.Alias('gen-make-rule', gen)
+
+elif target == 'preprocess':
+	if output_file != '':
+		gen = env.PlainClang(output_file,input_files)
+	else:
+		gen = env.PlainClangNoTarget(None,input_files)
+
+	env.Alias('preprocess', gen)
+
+elif target == 'compile':
+	asm_nodes = compile_files(input_files)
+	env.Alias('compile', asm_nodes)
+
+elif target == 'assemble':
+	obj_nodes = assemble_files(input_files)
+	env.Alias('assemble', obj_nodes)
+
+elif target == 'link' or target == 'link-shared-obj':
+	kremlib_obj = SConscript(kremlib_dir + 'SConstruct')
+	to_assemble = [f for f in input_files if f.endswith(('.c','.cpp','.s'))] 
+	pre_assembled = [f for f in input_files if f not in to_assemble]
+
+	newly_assembled = assemble_files(to_assemble)
+
+	if output_file == '':
+		link_target = '#a.out'
+	else:
+		link_target = output_file
+
+	if target == 'link':
+		prog = env.Program(link_target, 
+							newly_assembled + pre_assembled + kremlib_obj[0])
+		sregions = env.Command('#sregions.txt', prog, "nm $SOURCE | grep \"_krem_\" | perl -p -i -e \'s/^.*krem_prefix//g; s/_krem_/\t/g\' > $TARGET")
+		env.Alias('link', [prog,sregions])
+
+	else:
+		pre_assembled_files = []
+		if target == 'link-shared-obj':
+			for x in newly_assembled:
+				x.attributes.shared = 1
+			for x in pre_assembled:
+				f = env.File(x)
+				f.attributes.shared = 1
+				pre_assembled_files.append(f)
+		shared_obj = env.SharedLibrary(target = link_target, \
+						source = newly_assembled + pre_assembled_files \
+						+ kremlib_obj[1], SHLIBPREFIX='')
+		env.Alias('link-shared-obj', shared_obj)
